@@ -380,6 +380,173 @@ PARAMETER num_gpu 20
 
 ---
 
+## Phase 8: Plugging Gemma 4 into Project-Lobster (AI-Powered Data Harvesting)
+
+This is where things get really interesting. If you've seen my [Project-Lobster](https://github.com/kurodayu23/Project-Lobster) repo, you know it's a high-concurrency async data harvesting engine. On its own, Lobster is a brute-force fetcher — it grabs raw data fast and resilient. But raw data is just noise until you make sense of it.
+
+The idea here: **Lobster harvests at scale, Gemma 4 thinks locally.** No data leaves your machine.
+
+### The Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Your Local Machine                     │
+│                                                          │
+│  ┌──────────────┐    raw JSON    ┌───────────────────┐  │
+│  │   Lobster     │ ────────────► │  Gemma 4 (Ollama) │  │
+│  │  (aiohttp)    │               │  localhost:11434   │  │
+│  │  50 workers   │ ◄──────────── │  structured output │  │
+│  └──────────────┘    insights    └───────────────────┘  │
+│         │                                │               │
+│         ▼                                ▼               │
+│  ┌──────────────┐               ┌───────────────────┐   │
+│  │  Raw Data     │               │  Analyzed Results  │  │
+│  │  (JSON dump)  │               │  (Markdown/CSV)    │  │
+│  └──────────────┘               └───────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Extend Lobster with an AI Analysis Layer
+
+Create a new file `lobster_with_gemma.py` alongside the original engine:
+
+```python
+import asyncio
+import aiohttp
+import json
+import urllib.request
+import logging
+from typing import List, Dict
+
+logging.basicConfig(level=logging.INFO, format="[Lobster+Gemma] %(asctime)s - %(message)s")
+
+class GemmaAnalyzer:
+    """Wraps local Gemma 4 via Ollama for post-harvest intelligence."""
+    
+    def __init__(self, model: str = "gemma3:12b"):
+        self.model = model
+        self.endpoint = "http://localhost:11434/api/generate"
+    
+    def analyze(self, raw_data: dict) -> str:
+        """Send harvested data to Gemma for structured extraction."""
+        payload = {
+            "model": self.model,
+            "prompt": f"""You are a data analyst. Analyze the following raw API response 
+and extract: 1) Key entities mentioned, 2) Sentiment (positive/negative/neutral), 
+3) A one-sentence summary.
+
+Raw data:
+{json.dumps(raw_data, indent=2)[:2000]}
+
+Return your analysis as valid JSON with keys: entities, sentiment, summary.""",
+            "stream": False,
+            "options": {"temperature": 0.1}
+        }
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.endpoint, data=data, 
+                                     headers={"Content-Type": "application/json"})
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                return result.get("response", "")
+        except Exception as e:
+            logging.error(f"Gemma analysis failed: {e}")
+            return '{"error": "analysis_failed"}'
+
+
+class SmartLobsterEngine:
+    """
+    Lobster v2: Now with a brain.
+    Harvests data at scale, then runs each result through local Gemma 4.
+    """
+    
+    def __init__(self, concurrency: int = 10):
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.analyzer = GemmaAnalyzer()
+        self.headers = {"User-Agent": "Lobster/2.0 (Gemma-Enhanced)"}
+    
+    async def fetch_single(self, session: aiohttp.ClientSession, target_id: int) -> Dict:
+        """Fetch a single target with concurrency control."""
+        url = f"https://jsonplaceholder.typicode.com/posts/{target_id}"
+        
+        async with self.semaphore:
+            try:
+                async with session.get(url, headers=self.headers, timeout=5) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return {"id": target_id, "status": "harvested", "payload": data}
+            except Exception as e:
+                return {"id": target_id, "status": "failed", "error": str(e)}
+    
+    async def harvest_batch(self, count: int) -> List[Dict]:
+        """Phase 1: Parallel harvest."""
+        logging.info(f"Launching swarm: {count} targets...")
+        async with aiohttp.ClientSession() as session:
+            tasks = [self.fetch_single(session, i) for i in range(1, count + 1)]
+            return await asyncio.gather(*tasks)
+    
+    def enrich_with_gemma(self, harvested: List[Dict]) -> List[Dict]:
+        """Phase 2: Sequential AI analysis (GPU is the bottleneck, not network)."""
+        enriched = []
+        successful = [r for r in harvested if r["status"] == "harvested"]
+        
+        logging.info(f"Sending {len(successful)} results to Gemma 4 for analysis...")
+        for i, result in enumerate(successful):
+            logging.info(f"Analyzing [{i+1}/{len(successful)}]...")
+            ai_insight = self.analyzer.analyze(result["payload"])
+            result["gemma_analysis"] = ai_insight
+            enriched.append(result)
+        
+        return enriched
+
+
+if __name__ == "__main__":
+    engine = SmartLobsterEngine(concurrency=20)
+    
+    # Phase 1: Network harvest (async, fast)
+    raw_results = asyncio.run(engine.harvest_batch(10))
+    
+    # Phase 2: AI enrichment (sync, GPU-bound)
+    smart_results = engine.enrich_with_gemma(raw_results)
+    
+    # Phase 3: Output
+    with open("lobster_gemma_output.json", "w", encoding="utf-8") as f:
+        json.dump(smart_results, f, indent=2, ensure_ascii=False)
+    
+    logging.info(f"Pipeline complete. {len(smart_results)} enriched records saved.")
+```
+
+### Step 2: Run the Integrated Pipeline
+
+Make sure Ollama is serving Gemma 4 first:
+
+```powershell
+# Terminal 1: Ensure Ollama is running
+ollama serve
+
+# Terminal 2: Run the smart lobster
+python lobster_with_gemma.py
+```
+
+### What's Actually Happening Here
+
+1. **Lobster's async swarm** fires off 10-50 concurrent HTTP requests using `aiohttp` + `asyncio.Semaphore`. This takes about 1-2 seconds for 50 targets.
+2. **Each harvested payload** is then fed to your local Gemma 4 instance for structured extraction (entities, sentiment, summary).
+3. The results are saved as an enriched JSON file. Zero data leaves your machine.
+
+### Why This Matters for Your Portfolio
+
+Most people either build scrapers OR play with LLMs. Almost nobody shows them **working together in a real pipeline**. This integration proves you understand:
+- Async I/O for network-bound tasks
+- Synchronous GPU-bound inference constraints
+- How to architect a system where each component plays to its strength
+
+> **Performance note**: The bottleneck flips here. During harvest, it's network-bound (async wins). During Gemma analysis, it's GPU-bound (parallelizing LLM calls on a single GPU doesn't help — you'd just OOM). That's why Phase 2 is intentionally synchronous. Real engineering is knowing *when not to parallelize*.
+
+---
+
 ## Troubleshooting (The Stuff Nobody Tells You)
 
 ### "Error: model requires more system memory than is available"

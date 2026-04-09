@@ -307,6 +307,151 @@ ollama run gemma-code
 
 ---
 
+## 第八阶段：将 Gemma 4 接入龙虾引擎（AI 驱动的数据采集）
+
+这里才是真正有意思的部分。如果你看过我的 [Project-Lobster](https://github.com/kurodayu23/Project-Lobster) 仓库，你就知道它是一个高并发的异步数据采集引擎。但单独的 Lobster 只是个暴力拉取器——它能又快又稳地抓到原始数据。然而，原始数据在你理解它之前就只是噪音。
+
+核心理念：**龙虾负责大规模采集，Gemma 4 负责本地思考。** 全程零数据外泄。
+
+### 整体架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     你的本地机器                          │
+│                                                          │
+│  ┌──────────────┐    原始 JSON   ┌───────────────────┐  │
+│  │   龙虾引擎    │ ────────────► │  Gemma 4 (Ollama) │  │
+│  │  (aiohttp)    │               │  localhost:11434   │  │
+│  │  50 个 worker │ ◄──────────── │  结构化输出        │  │
+│  └──────────────┘    分析洞察    └───────────────────┘  │
+│         │                                │               │
+│         ▼                                ▼               │
+│  ┌──────────────┐               ┌───────────────────┐   │
+│  │  原始数据     │               │  分析结果          │   │
+│  │  (JSON 转储)  │               │  (Markdown/CSV)    │  │
+│  └──────────────┘               └───────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 步骤 1：为龙虾扩展 AI 分析层
+
+在原始引擎旁边创建一个新文件 `lobster_with_gemma.py`：
+
+```python
+import asyncio
+import aiohttp
+import json
+import urllib.request
+import logging
+from typing import List, Dict
+
+logging.basicConfig(level=logging.INFO, format="[Lobster+Gemma] %(asctime)s - %(message)s")
+
+class GemmaAnalyzer:
+    """封装本地 Gemma 4（通过 Ollama），用于采集后的智能分析。"""
+    
+    def __init__(self, model: str = "gemma3:12b"):
+        self.model = model
+        self.endpoint = "http://localhost:11434/api/generate"
+    
+    def analyze(self, raw_data: dict) -> str:
+        payload = {
+            "model": self.model,
+            "prompt": f"""你是一个数据分析师。分析以下原始 API 响应，
+提取：1) 提到的关键实体，2) 情感倾向（正面/负面/中性），
+3) 一句话总结。
+
+原始数据：
+{json.dumps(raw_data, indent=2)[:2000]}
+
+以合法 JSON 格式返回，键名为：entities, sentiment, summary。""",
+            "stream": False,
+            "options": {"temperature": 0.1}
+        }
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.endpoint, data=data, 
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                return result.get("response", "")
+        except Exception as e:
+            logging.error(f"Gemma 分析失败: {e}")
+            return '{"error": "analysis_failed"}'
+
+class SmartLobsterEngine:
+    """龙虾 v2：现在有脑子了。先大规模采集，再逐条通过本地 Gemma 4 分析。"""
+    
+    def __init__(self, concurrency: int = 10):
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.analyzer = GemmaAnalyzer()
+    
+    async def fetch_single(self, session, target_id: int) -> Dict:
+        url = f"https://jsonplaceholder.typicode.com/posts/{target_id}"
+        async with self.semaphore:
+            try:
+                async with session.get(url, timeout=5) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return {"id": target_id, "status": "harvested", "payload": data}
+            except Exception as e:
+                return {"id": target_id, "status": "failed", "error": str(e)}
+    
+    async def harvest_batch(self, count: int) -> List[Dict]:
+        async with aiohttp.ClientSession() as session:
+            tasks = [self.fetch_single(session, i) for i in range(1, count + 1)]
+            return await asyncio.gather(*tasks)
+    
+    def enrich_with_gemma(self, harvested: List[Dict]) -> List[Dict]:
+        """第二阶段：顺序 AI 分析（瓶颈在 GPU，不在网络）"""
+        enriched = []
+        successful = [r for r in harvested if r["status"] == "harvested"]
+        for i, result in enumerate(successful):
+            logging.info(f"正在分析 [{i+1}/{len(successful)}]...")
+            result["gemma_analysis"] = self.analyzer.analyze(result["payload"])
+            enriched.append(result)
+        return enriched
+
+if __name__ == "__main__":
+    engine = SmartLobsterEngine(concurrency=20)
+    raw_results = asyncio.run(engine.harvest_batch(10))
+    smart_results = engine.enrich_with_gemma(raw_results)
+    
+    with open("lobster_gemma_output.json", "w", encoding="utf-8") as f:
+        json.dump(smart_results, f, indent=2, ensure_ascii=False)
+    logging.info(f"流水线完成。{len(smart_results)} 条记录已保存。")
+```
+
+### 步骤 2：运行集成流水线
+
+先确保 Ollama 在跑着 Gemma 4：
+
+```powershell
+# 终端 1：确保 Ollama 运行中
+ollama serve
+
+# 终端 2：运行聪明的龙虾
+python lobster_with_gemma.py
+```
+
+### 这里到底发生了什么
+
+1. **龙虾的异步蜂群** 通过 `aiohttp` + `asyncio.Semaphore` 并发发射 10-50 个 HTTP 请求。50 个目标大概只需 1-2 秒。
+2. **每个采集到的数据包** 随后被喂给你本地的 Gemma 4 实例进行结构化提取（实体、情感、摘要）。
+3. 结果保存为一个富化后的 JSON 文件。全程零数据外泄。
+
+### 为什么这对你的作品集很重要
+
+大多数人要么只会写爬虫，要么只会玩大模型。几乎没有人展示它们**在一个真实管线中的协同工作**。这种集成证明你理解：
+- 网络密集型任务需要异步 I/O
+- GPU 密集型推理有同步约束
+- 如何让架构中的每个组件各司其职
+
+> **性能小贴士**：瓶颈在这里发生了翻转。采集阶段是网络瓶颈（异步并发大显身手）；Gemma 分析阶段是 GPU 瓶颈（在单 GPU 上并行化 LLM 调用只会 OOM）。所以第二阶段是故意做成顺序的。**真正的工程素养，是知道什么时候不该并行化。**
+
+---
+
 ## 疑难杂症排查（那些没人告诉你的坑）
 
 ### "Error: model requires more system memory than is available"

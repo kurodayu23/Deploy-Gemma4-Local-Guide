@@ -209,6 +209,120 @@ ollama run gemma-code
 
 ---
 
+## フェーズ 8：Gemma 4 を Project-Lobster に接続する（AI 駆動のデータ収集）
+
+ここからが本当に面白いところです。私の [Project-Lobster](https://github.com/kurodayu23/Project-Lobster) リポジトリを見たことがあれば、これが高並行性の非同期データ収集エンジンであることはご存知でしょう。単体の Lobster はブルートフォースフェッチャーです。しかし、生データは理解するまではただのノイズです。
+
+コアコンセプト：**Lobster が大規模に収集し、Gemma 4 がローカルで思考する。** データは一切外部に出ません。
+
+### アーキテクチャ
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   ローカルマシン                          │
+│                                                          │
+│  ┌──────────────┐    生 JSON     ┌───────────────────┐  │
+│  │   Lobster     │ ────────────► │  Gemma 4 (Ollama) │  │
+│  │  (aiohttp)    │               │  localhost:11434   │  │
+│  │  50 workers   │ ◄──────────── │  構造化出力        │  │
+│  └──────────────┘    分析結果    └───────────────────┘  │
+│         │                                │               │
+│         ▼                                ▼               │
+│  ┌──────────────┐               ┌───────────────────┐   │
+│  │  生データ     │               │  分析済み結果      │   │
+│  │  (JSON)       │               │  (Markdown/CSV)    │  │
+│  └──────────────┘               └───────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### ステップ 1：Lobster に AI 分析レイヤーを追加
+
+```python
+import asyncio, aiohttp, json, urllib.request, logging
+from typing import List, Dict
+
+logging.basicConfig(level=logging.INFO, format="[Lobster+Gemma] %(asctime)s - %(message)s")
+
+class GemmaAnalyzer:
+    """ローカル Gemma 4 を Ollama 経由でラップし、収集後のインテリジェント分析を実行。"""
+    
+    def __init__(self, model: str = "gemma3:12b"):
+        self.model = model
+        self.endpoint = "http://localhost:11434/api/generate"
+    
+    def analyze(self, raw_data: dict) -> str:
+        payload = {
+            "model": self.model,
+            "prompt": f"""データアナリストとして、以下のAPIレスポンスを分析し、
+1) 言及されたキーエンティティ、2) センチメント、3) 一文の要約を抽出してください。
+生データ：{json.dumps(raw_data, indent=2)[:2000]}
+JSON形式で返してください。""",
+            "stream": False, "options": {"temperature": 0.1}
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.endpoint, data=data, 
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("response", "")
+        except Exception as e:
+            return '{"error": "analysis_failed"}'
+
+class SmartLobsterEngine:
+    """Lobster v2：頭脳を搭載。大規模収集後、ローカル Gemma 4 で各結果を分析。"""
+    def __init__(self, concurrency=10):
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.analyzer = GemmaAnalyzer()
+    
+    async def fetch_single(self, session, tid):
+        async with self.semaphore:
+            try:
+                async with session.get(f"https://jsonplaceholder.typicode.com/posts/{tid}", timeout=5) as r:
+                    return {"id": tid, "status": "harvested", "payload": await r.json()}
+            except: return {"id": tid, "status": "failed"}
+    
+    async def harvest_batch(self, count):
+        async with aiohttp.ClientSession() as s:
+            return await asyncio.gather(*[self.fetch_single(s, i) for i in range(1, count+1)])
+    
+    def enrich_with_gemma(self, harvested):
+        enriched = []
+        ok = [r for r in harvested if r["status"] == "harvested"]
+        for i, r in enumerate(ok):
+            logging.info(f"分析中 [{i+1}/{len(ok)}]...")
+            r["gemma_analysis"] = self.analyzer.analyze(r["payload"])
+            enriched.append(r)
+        return enriched
+
+if __name__ == "__main__":
+    engine = SmartLobsterEngine(concurrency=20)
+    raw = asyncio.run(engine.harvest_batch(10))
+    smart = engine.enrich_with_gemma(raw)
+    with open("output.json", "w", encoding="utf-8") as f:
+        json.dump(smart, f, indent=2, ensure_ascii=False)
+```
+
+### ステップ 2：統合パイプラインの実行
+
+```powershell
+# ターミナル 1：Ollama が実行中であることを確認
+ollama serve
+
+# ターミナル 2：スマートな Lobster を実行
+python lobster_with_gemma.py
+```
+
+### なぜこれがポートフォリオに重要か
+
+ほとんどの人はスクレイパーを作る**か** LLM で遊ぶ**か**のどちらかです。**実際のパイプラインで連携** させている人はほぼいません。この統合は以下を理解していることを証明します：
+- ネットワークバウンドタスクには非同期 I/O
+- GPU バウンドの推論には同期的制約
+- 各コンポーネントの強みを活かすアーキテクチャ設計
+
+> **パフォーマンスノート**: ボトルネックがここで反転します。収集フェーズではネットワークバウンド（非同期の勝利）。Gemma 分析フェーズでは GPU バウンド（単一 GPU で LLM 呼び出しを並列化しても OOM になるだけ）。だからフェーズ 2 は意図的に同期です。**本物のエンジニアリングとは、並列化すべきでないときを知ることです。**
+
+---
+
 ## トラブルシューティング（誰も教えてくれないこと）
 
 ### "CUDA out of memory"
